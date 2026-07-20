@@ -1,30 +1,40 @@
 # SSD Temperature Monitor
 
-A Windows CLI written in Rust that watches your drive's temperature and only updates the screen when something changes. Every change goes to a log file silently in the background.
+A CLI utility written in Rust that watches your drive's temperature and only updates the screen when something changes. Every change goes to a log file silently in the background.
 
 Vibe coded with [Antigravity](https://antigravity.dev).
 
 ## Requirements
 
-- Windows 10 or 11
-- Administrator privileges (Windows requires it to read hardware sensor data)
-- No runtime dependencies — just the compiled `.exe`
+- **Windows**: Windows 10/11, Administrator privileges (required to read hardware sensor data via PowerShell/WMI).
+- **Linux**: Root privileges may be required depending on the drive type (reads from `/sys/class/hwmon`, `/sys/block`, or uses `smartctl` as fallback).
+- No runtime dependencies — just the compiled binaries.
 
 ## Building
 
-```
-cargo build --release
+The project is split into two separate binaries to handle platform-specific logic cleanly.
+
+```bash
+# Build for Windows (must be run on Windows)
+cargo build --bin monitor_ssd_win --release
+
+# Build for Linux (must be run on Linux or WSL)
+cargo build --bin monitor_ssd_linux --release
 ```
 
-The binary ends up at `target\release\monitor_ssd.exe`.
+The binaries will be located at `target/release/monitor_ssd_win.exe` and `target/release/monitor_ssd_linux`.
 
 ## Usage
 
-```
-monitor_ssd.exe [options]
+```bash
+# Windows
+monitor_ssd_win.exe [options]
+
+# Linux
+./monitor_ssd_linux [options]
 ```
 
-Running without arguments monitors Disk 0 and shows the current temperature right away, without waiting for it to change first.
+Running without arguments monitors Disk 0 (or the first NVMe drive on Linux) and shows the current temperature right away.
 
 ### Options
 
@@ -36,12 +46,14 @@ Running without arguments monitors Disk 0 and shows the current temperature righ
 
 ### Examples
 
+```bash
+monitor_ssd_win.exe -d
+monitor_ssd_linux -d -i 5
 ```
-monitor_ssd.exe
-monitor_ssd.exe -d
-monitor_ssd.exe -d -i 5
-monitor_ssd.exe --interval 10 --log D:\logs\ssd.log
-```
+
+## Legacy Python Version
+
+The original Python version of this tool is preserved in the `legacy_python/` directory. It works identically on Windows but requires Python 3.10+ to run. It serves as historical reference and is no longer actively updated.
 
 ## What it looks like
 
