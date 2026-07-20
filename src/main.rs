@@ -1,7 +1,9 @@
 use std::{
     fs::OpenOptions,
     io::{self, Write},
+    os::windows::process::CommandExt,
     path::PathBuf,
+    process::Command,
     time::Duration,
 };
 
@@ -31,12 +33,6 @@ struct PhysicalDisk {
     size: Option<u64>,
 }
 
-#[derive(Deserialize, Debug)]
-struct ReliabilityCounter {
-    #[serde(rename = "Temperature")]
-    temperature: Option<u8>,
-}
-
 // ─── CLI args ────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -62,7 +58,6 @@ struct Args {
 }
 
 // ─── Raw mode guard ──────────────────────────────────────────────────────────
-// Ensures raw mode and cursor are restored even if an early return or panic occurs.
 
 struct RawModeGuard;
 
@@ -74,22 +69,6 @@ impl Drop for RawModeGuard {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-fn media_type_str(mt: u16) -> &'static str {
-    match mt {
-        3 => "HDD",
-        4 => "SSD",
-        5 => "SCM",
-        _ => "Unknown",
-    }
-}
-
-fn format_size(bytes: Option<u64>) -> String {
-    bytes
-        .filter(|&b| b > 0)
-        .map(|b| format!("{:.1} GB", b as f64 / 1_073_741_824.0))
-        .unwrap_or_else(|| "? GB".to_string())
-}
 
 fn build_temp_bar(temp: u8) -> String {
     let color = if temp < 40 {
@@ -126,14 +105,24 @@ fn get_all_disks(wmi: &WMIConnection) -> Result<Vec<PhysicalDisk>> {
     Ok(disks)
 }
 
-fn get_temperature(wmi: &WMIConnection, disk_id: &str) -> Result<Option<u8>> {
-    let query = format!(
-        "SELECT Temperature FROM MSFT_StorageReliabilityCounter WHERE DeviceId = '{disk_id}'"
+fn get_temperature(disk_id: &str) -> Option<u8> {
+    // MSFT_StorageReliabilityCounter via direct WQL returns empty on most drivers.
+    // PowerShell uses CIM association (Get-PhysicalDisk | Get-StorageReliabilityCounter)
+    // which is the only reliable path on Windows without raw IOCTL.
+    let script = format!(
+        "(Get-PhysicalDisk | Where-Object DeviceId -eq {} | Get-StorageReliabilityCounter).Temperature",
+        disk_id
     );
-    let results: Vec<ReliabilityCounter> = wmi
-        .raw_query(query)
-        .context("Failed to query temperature. Run as Administrator.")?;
-    Ok(results.first().and_then(|r| r.temperature))
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .ok()?;
+
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u8>()
+        .ok()
 }
 
 // ─── Display + log ────────────────────────────────────────────────────────────
@@ -155,7 +144,7 @@ fn display_and_log(
     let mut file = OpenOptions::new().create(true).append(true).open(log_path)?;
     writeln!(file, "[{now}] Disk {disk_id} ({disk_name}) | Temperature: {temp}°C")?;
 
-    // \x1b[K erases from cursor to end of line so shorter lines don't leave ghost chars
+    // \r goes to column 0; \x1b[K erases to end of line to avoid ghost characters
     print!("\r  [\x1b[90m{now}\x1b[0m] {}\x1b[K", build_temp_bar(temp));
     io::stdout().flush()?;
     Ok(())
@@ -190,13 +179,24 @@ fn disk_selector(disks: &[PhysicalDisk]) -> Result<usize> {
             } else {
                 ("  ", "\x1b[90m")
             };
+            let size_str = disk
+                .size
+                .filter(|&b| b > 0)
+                .map(|b| format!("{:.1} GB", b as f64 / 1_073_741_824.0))
+                .unwrap_or_else(|| "? GB".to_string());
+            let type_str = match disk.media_type {
+                3 => "HDD",
+                4 => "SSD",
+                5 => "SCM",
+                _ => "Unknown",
+            };
             println!(
                 "  {}{style}Disk {:<4}\x1b[0m  \x1b[97m{:<35}\x1b[0m  \x1b[93m{:<12}\x1b[0m  \x1b[92m{}\x1b[0m",
                 prefix,
                 disk.device_id,
                 disk.friendly_name,
-                media_type_str(disk.media_type),
-                format_size(disk.size),
+                type_str,
+                size_str,
             );
         }
         stdout.flush()?;
@@ -212,7 +212,9 @@ fn disk_selector(disks: &[PhysicalDisk]) -> Result<usize> {
                     }
                     KeyCode::Enter => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        println!("\n\n  \x1b[96mMonitor stopped. Goodbye!\x1b[0m\n");
+                        // _guard drops here, restoring terminal before exit
+                        drop(_guard);
+                        println!("\r\n\r\n  \x1b[96mMonitor stopped. Goodbye!\x1b[0m\r\n");
                         std::process::exit(0);
                     }
                     _ => {}
@@ -227,7 +229,7 @@ fn disk_selector(disks: &[PhysicalDisk]) -> Result<usize> {
 // ─── Monitor loop ────────────────────────────────────────────────────────────
 
 fn monitor_loop(
-    wmi: &WMIConnection,
+    _wmi: &WMIConnection,
     disk_id: &str,
     disk_name: &str,
     interval: u64,
@@ -255,15 +257,18 @@ fn monitor_loop(
     let mut last_temp: Option<u8> = None;
 
     // Show temperature immediately on start without waiting for the first interval
-    if let Some(temp) = get_temperature(wmi, disk_id)? {
-        display_and_log(temp, &mut last_temp, disk_id, disk_name, log_path)?;
+    match get_temperature(disk_id) {
+        Some(temp) => display_and_log(temp, &mut last_temp, disk_id, disk_name, log_path)?,
+        None => {
+            print!("\r  \x1b[90mWaiting for sensor data... (run as Administrator if stuck)\x1b[0m");
+            stdout.flush()?;
+        }
     }
 
     let interval_dur = Duration::from_secs(interval);
 
     loop {
-        // poll() blocks for up to `interval_dur`. If an event arrives first it returns true.
-        // If the timeout elapses with no events it returns false — that's when we check temp.
+        // poll() blocks for up to interval_dur. True = event arrived, false = timeout.
         if event::poll(interval_dur)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press
@@ -274,14 +279,22 @@ fn monitor_loop(
                 }
             }
         } else {
-            if let Some(temp) = get_temperature(wmi, disk_id)? {
-                display_and_log(temp, &mut last_temp, disk_id, disk_name, log_path)?;
+            match get_temperature(disk_id) {
+                Some(temp) => {
+                    display_and_log(temp, &mut last_temp, disk_id, disk_name, log_path)?
+                }
+                None if last_temp.is_none() => {
+                    print!("\r  \x1b[90mWaiting for sensor data...\x1b[0m\x1b[K");
+                    stdout.flush()?;
+                }
+                _ => {}
             }
         }
     }
 
-    // _guard drops here: raw mode off, cursor visible
-    println!("\n\n  \x1b[96mMonitor stopped. Goodbye!\x1b[0m\n");
+    // _guard drops here: raw mode off, cursor visible.
+    // Use \r\n instead of \n so the text aligns correctly after raw mode.
+    println!("\r\n\r\n  \x1b[96mMonitor stopped. Goodbye!\x1b[0m\r\n");
     Ok(())
 }
 
