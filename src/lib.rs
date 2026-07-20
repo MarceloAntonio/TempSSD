@@ -1,13 +1,14 @@
+// Shared code used by both the Windows and Linux binaries.
+// Platform-specific functions (get_temperature, get_all_disks) live in each binary.
+
 use std::{
     fs::OpenOptions,
     io::{self, Write},
-    os::windows::process::CommandExt,
     path::PathBuf,
-    process::Command,
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Local;
 use clap::Parser;
 use crossterm::{
@@ -16,33 +17,25 @@ use crossterm::{
     execute,
     terminal::{self, ClearType},
 };
-use serde::Deserialize;
-use wmi::{COMLibrary, WMIConnection};
 
-// ─── WMI structs ────────────────────────────────────────────────────────────
+// ─── Common disk struct ──────────────────────────────────────────────────────
+// Each binary constructs this from its own platform data source.
 
-#[derive(Deserialize, Debug, Clone)]
-struct PhysicalDisk {
-    #[serde(rename = "DeviceId")]
-    device_id: String,
-    #[serde(rename = "FriendlyName")]
-    friendly_name: String,
-    #[serde(rename = "MediaType")]
-    media_type: u16,
-    #[serde(rename = "Size")]
-    size: Option<u64>,
+#[derive(Debug, Clone)]
+pub struct Disk {
+    pub device_id: String,
+    pub friendly_name: String,
+    pub media_type: String,
+    pub size_gb: f64,
 }
 
 // ─── CLI args ────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(
-    name = "monitor_ssd",
-    about = "Real-time SSD temperature monitor for Windows."
-)]
-struct Args {
+#[command(about = "Real-time SSD temperature monitor.")]
+pub struct Args {
     #[arg(short = 'd', long, help = "Interactive disk selector")]
-    disk: bool,
+    pub disk: bool,
 
     #[arg(
         short = 'i',
@@ -51,15 +44,15 @@ struct Args {
         value_name = "SECONDS",
         help = "Polling interval in seconds (default: 3)"
     )]
-    interval: u64,
+    pub interval: u64,
 
     #[arg(short = 'l', long, value_name = "PATH", help = "Log file path")]
-    log: Option<PathBuf>,
+    pub log: Option<PathBuf>,
 }
 
 // ─── Raw mode guard ──────────────────────────────────────────────────────────
 
-struct RawModeGuard;
+pub struct RawModeGuard;
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
@@ -68,9 +61,9 @@ impl Drop for RawModeGuard {
     }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── UI helpers ──────────────────────────────────────────────────────────────
 
-fn build_temp_bar(temp: u8) -> String {
+pub fn build_temp_bar(temp: u8) -> String {
     let color = if temp < 40 {
         "\x1b[92m"
     } else if temp <= 55 {
@@ -88,46 +81,14 @@ fn build_temp_bar(temp: u8) -> String {
     )
 }
 
-fn print_header() {
+pub fn print_header() {
     let line = "=".repeat(54);
     println!("\x1b[96m{}\x1b[0m", line);
     println!("\x1b[96m\x1b[1m{:^54}\x1b[0m", "SSD TEMPERATURE MONITOR");
     println!("\x1b[96m{}\x1b[0m", line);
 }
 
-// ─── WMI queries ─────────────────────────────────────────────────────────────
-
-fn get_all_disks(wmi: &WMIConnection) -> Result<Vec<PhysicalDisk>> {
-    let mut disks: Vec<PhysicalDisk> = wmi
-        .raw_query("SELECT DeviceId, FriendlyName, MediaType, Size FROM MSFT_PhysicalDisk")
-        .context("Failed to query physical disks. Run as Administrator.")?;
-    disks.sort_by_key(|d| d.device_id.parse::<u32>().unwrap_or(u32::MAX));
-    Ok(disks)
-}
-
-fn get_temperature(disk_id: &str) -> Option<u8> {
-    // MSFT_StorageReliabilityCounter via direct WQL returns empty on most drivers.
-    // PowerShell uses CIM association (Get-PhysicalDisk | Get-StorageReliabilityCounter)
-    // which is the only reliable path on Windows without raw IOCTL.
-    let script = format!(
-        "(Get-PhysicalDisk | Where-Object DeviceId -eq {} | Get-StorageReliabilityCounter).Temperature",
-        disk_id
-    );
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .output()
-        .ok()?;
-
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u8>()
-        .ok()
-}
-
-// ─── Display + log ────────────────────────────────────────────────────────────
-
-fn display_and_log(
+pub fn display_and_log(
     temp: u8,
     last: &mut Option<u8>,
     disk_id: &str,
@@ -144,7 +105,6 @@ fn display_and_log(
     let mut file = OpenOptions::new().create(true).append(true).open(log_path)?;
     writeln!(file, "[{now}] Disk {disk_id} ({disk_name}) | Temperature: {temp}°C")?;
 
-    // \r goes to column 0; \x1b[K erases to end of line to avoid ghost characters
     print!("\r  [\x1b[90m{now}\x1b[0m] {}\x1b[K", build_temp_bar(temp));
     io::stdout().flush()?;
     Ok(())
@@ -152,7 +112,7 @@ fn display_and_log(
 
 // ─── Disk selector UI ────────────────────────────────────────────────────────
 
-fn disk_selector(disks: &[PhysicalDisk]) -> Result<usize> {
+pub fn disk_selector(disks: &[Disk]) -> Result<usize> {
     let mut stdout = io::stdout();
     let mut selected = 0usize;
 
@@ -179,24 +139,13 @@ fn disk_selector(disks: &[PhysicalDisk]) -> Result<usize> {
             } else {
                 ("  ", "\x1b[90m")
             };
-            let size_str = disk
-                .size
-                .filter(|&b| b > 0)
-                .map(|b| format!("{:.1} GB", b as f64 / 1_073_741_824.0))
-                .unwrap_or_else(|| "? GB".to_string());
-            let type_str = match disk.media_type {
-                3 => "HDD",
-                4 => "SSD",
-                5 => "SCM",
-                _ => "Unknown",
-            };
             println!(
-                "  {}{style}Disk {:<4}\x1b[0m  \x1b[97m{:<35}\x1b[0m  \x1b[93m{:<12}\x1b[0m  \x1b[92m{}\x1b[0m",
+                "  {}{style}{:<6}\x1b[0m  \x1b[97m{:<35}\x1b[0m  \x1b[93m{:<12}\x1b[0m  \x1b[92m{:.1} GB\x1b[0m",
                 prefix,
                 disk.device_id,
                 disk.friendly_name,
-                type_str,
-                size_str,
+                disk.media_type,
+                disk.size_gb,
             );
         }
         stdout.flush()?;
@@ -212,7 +161,6 @@ fn disk_selector(disks: &[PhysicalDisk]) -> Result<usize> {
                     }
                     KeyCode::Enter => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // _guard drops here, restoring terminal before exit
                         drop(_guard);
                         println!("\r\n\r\n  \x1b[96mMonitor stopped. Goodbye!\x1b[0m\r\n");
                         std::process::exit(0);
@@ -228,12 +176,12 @@ fn disk_selector(disks: &[PhysicalDisk]) -> Result<usize> {
 
 // ─── Monitor loop ────────────────────────────────────────────────────────────
 
-fn monitor_loop(
-    _wmi: &WMIConnection,
+pub fn monitor_loop(
     disk_id: &str,
     disk_name: &str,
     interval: u64,
     log_path: &PathBuf,
+    get_temp: impl Fn(&str) -> Option<u8>,
 ) -> Result<()> {
     let mut stdout = io::stdout();
 
@@ -244,7 +192,7 @@ fn monitor_loop(
     )?;
     print_header();
     println!();
-    println!("  Monitoring: \x1b[93m{disk_name}\x1b[0m  \x1b[90m(Disk {disk_id})\x1b[0m");
+    println!("  Monitoring: \x1b[93m{disk_name}\x1b[0m  \x1b[90m({disk_id})\x1b[0m");
     println!("  Log file:   \x1b[93m{}\x1b[0m", log_path.display());
     println!("  \x1b[90mPress Ctrl+C to quit.\x1b[0m");
     println!();
@@ -256,11 +204,10 @@ fn monitor_loop(
 
     let mut last_temp: Option<u8> = None;
 
-    // Show temperature immediately on start without waiting for the first interval
-    match get_temperature(disk_id) {
+    match get_temp(disk_id) {
         Some(temp) => display_and_log(temp, &mut last_temp, disk_id, disk_name, log_path)?,
         None => {
-            print!("\r  \x1b[90mWaiting for sensor data... (run as Administrator if stuck)\x1b[0m");
+            print!("\r  \x1b[90mWaiting for sensor data...\x1b[0m");
             stdout.flush()?;
         }
     }
@@ -268,7 +215,6 @@ fn monitor_loop(
     let interval_dur = Duration::from_secs(interval);
 
     loop {
-        // poll() blocks for up to interval_dur. True = event arrived, false = timeout.
         if event::poll(interval_dur)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press
@@ -279,7 +225,7 @@ fn monitor_loop(
                 }
             }
         } else {
-            match get_temperature(disk_id) {
+            match get_temp(disk_id) {
                 Some(temp) => {
                     display_and_log(temp, &mut last_temp, disk_id, disk_name, log_path)?
                 }
@@ -292,41 +238,6 @@ fn monitor_loop(
         }
     }
 
-    // _guard drops here: raw mode off, cursor visible.
-    // Use \r\n instead of \n so the text aligns correctly after raw mode.
     println!("\r\n\r\n  \x1b[96mMonitor stopped. Goodbye!\x1b[0m\r\n");
-    Ok(())
-}
-
-// ─── Entry point ─────────────────────────────────────────────────────────────
-
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let log_path = args.log.unwrap_or_else(|| PathBuf::from("ssd_temp.log"));
-
-    let com_lib = COMLibrary::new().context("Failed to initialize COM.")?;
-    let wmi = WMIConnection::with_namespace_path("ROOT\\Microsoft\\Windows\\Storage", com_lib)
-        .context("Failed to connect to WMI. Run as Administrator.")?;
-
-    let (disk_id, disk_name) = if args.disk {
-        let disks = get_all_disks(&wmi)?;
-        if disks.is_empty() {
-            eprintln!("\x1b[91mNo disks found. Run as Administrator.\x1b[0m");
-            std::process::exit(1);
-        }
-        let idx = disk_selector(&disks)?;
-        let d = &disks[idx];
-        (d.device_id.clone(), d.friendly_name.clone())
-    } else {
-        let disks = get_all_disks(&wmi)?;
-        let name = disks
-            .iter()
-            .find(|d| d.device_id == "0")
-            .map(|d| d.friendly_name.clone())
-            .unwrap_or_else(|| "Disk 0".to_string());
-        ("0".to_string(), name)
-    };
-
-    monitor_loop(&wmi, &disk_id, &disk_name, args.interval, &log_path)?;
     Ok(())
 }
