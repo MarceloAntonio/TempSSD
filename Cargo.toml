@@ -1,0 +1,16 @@
+[package]
+name = "monitor-ssd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "monitor_ssd"
+path = "src/main.rs"
+
+[dependencies]
+wmi      = "0.13"
+serde    = { version = "1", features = ["derive"] }
+clap     = { version = "4", features = ["derive"] }
+crossterm = "0.27"
+chrono   = "0.4"
+anyhow   = "1"
